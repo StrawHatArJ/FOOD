@@ -1,200 +1,232 @@
-import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import streamlit as st
+import requests
+import google.generativeai as genai
+import os
+import json
+# Try to load local .env variables if python-dotenv is installed (it gracefully ignores this in Streamlit Cloud)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCcUHBuLV0eQDsIVROH6X5_Khb8m88dWfE";
+st.set_page_config(page_title="Food Pharma", page_icon="🍎", layout="wide")
 
-// Open Food Facts search with retry logic
-async function fetchFoodData(query: string) {
-  const headers = { "User-Agent": "AIFoodAnalyzer/1.0" };
-  const maxRetries = 3;
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      let url: string;
-      const isBarcode = /^\d{8,}$/.test(query);
-
-      if (isBarcode) {
-        url = `https://world.openfoodfacts.org/api/v2/product/${query}.json`;
-      } else {
-        url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_simple=1&action=process&json=1`;
-      }
-
-      const res = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
-
-      if (res.status === 503 || res.status === 429) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
-      }
-
-      if (!res.ok) return { error: `API Error: ${res.status}` };
-
-      const data = await res.json();
-
-      if (isBarcode) {
-        if (data.product) {
-          return {
-            product_name: data.product.product_name || "Unknown Product",
-            ingredients_text: data.product.ingredients_text || "",
-            image_url: data.product.image_front_url || "",
-            nutriscore_grade: data.product.nutriscore_grade || "",
-            brands: data.product.brands || "",
-          };
-        }
-        return { error: "Product not found for this barcode." };
-      } else {
-        const products = data.products || [];
-        if (products.length === 0) return { error: "No products found." };
-        const p = products[0];
-        return {
-          product_name: p.product_name || "Unknown Product",
-          ingredients_text: p.ingredients_text || "",
-          image_url: p.image_front_url || "",
-          nutriscore_grade: p.nutriscore_grade || "",
-          brands: p.brands || "",
-        };
-      }
-    } catch {
-      if (attempt === maxRetries - 1) return { error: "Network timeout." };
-      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+# Custom UI Styling (Dark Mode & Glassmorphism)
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;800&display=swap');
+    
+    /* Apply styling to the main app container */
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+        color: #f8fafc;
+        font-family: 'Outfit', sans-serif;
     }
-  }
-  return { error: "Server overloaded. Try again later." };
-}
-
-// AI Analysis via Gemini — with maximum resilience fallback chain
-async function analyzeWithGemini(ingredients: string) {
-  if (!GEMINI_API_KEY) throw new Error("API Key missing");
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-
-  // Very broad list of exact model identifiers and aliases
-  const modelFallbacks = [
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-pro",
-    "gemini-1.5-pro-latest",
-    "gemini-pro",
-    "gemini-1.0-pro",
-    "gemini-1.5-flash-8b-latest",
-    "gemini-2.0-flash",
-  ];
-
-  const prompt = `You are an elite nutritionist AI evaluating a packaged food.
-Ingredients: ${ingredients}
-
-Evaluate strictly against WHO and FSSAI guidelines.
-
-Return ONLY a raw JSON object (no markdown fences):
-{
-  "health_score": <int 0-100>,
-  "score_label": "<one word: Excellent/Good/Moderate/Poor/Dangerous>",
-  "analysis": [
-    {"ingredient": "...", "limit": "...", "concern": "..."}
-  ],
-  "daily_limit": "<Full, detailed paragraph (3-4 sentences) explaining the scientific daily limit for these specific ingredients and their long-term health impact.>",
-  "alternatives": [
-    "<Detailed bullet point 1: Specific brand/item + why it is healthier + what nutritional benefit it provides>",
-    "<Detailed bullet point 2: Specific brand/item + why it is healthier + what nutritional benefit it provides>"
-  ]
-}
-
-Keep the ingredient table concise (Max 4), but go deep and educational in the "daily_limit" and "alternatives" sections.`;
-
-  let lastError: any = null;
-
-  for (const modelName of modelFallbacks) {
-    try {
-      console.log(`[AI] Checking ${modelName}...`);
-      const model = genAI.getGenerativeModel({ model: modelName });
-      
-      const result = await model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-      });
-
-      const response = await result.response;
-      const text = response.text();
-      const cleaned = text.replace(/```json/g, "").replace(/```/g, "").trim();
-      
-      const parsed = JSON.parse(cleaned);
-      if (parsed && typeof parsed.health_score === 'number') {
-        console.log(`[AI] Success with ${modelName}`);
-        return parsed;
-      }
-      throw new Error("Invalid format");
-    } catch (e: any) {
-      lastError = e;
-      const msg = (e.message || String(e)).toLowerCase();
-      console.error(`[AI] ${modelName} failed: ${msg}`);
-      if (msg.includes("429") || msg.includes("quota") || msg.includes("404") || msg.includes("not found")) {
-        continue;
-      }
-      continue;
-    }
-  }
-
-  // =========================================================================
-  // SMART MOCK FALLBACK (Failsafe for Interviews)
-  // Enhanced with detailed explanations as requested.
-  // =========================================================================
-  console.log("[AI] ⚠️ ALL MODELS EXHAUSTED. TRIGGERING SMART MOCK FALLBACK.");
-  
-  const isHealthy = ingredients.length < 50 || !/sugar|oil|syrup|acid|preservative/i.test(ingredients);
-  const mockup = {
-    health_score: isHealthy ? Math.floor(Math.random() * 15) + 80 : Math.floor(Math.random() * 25) + 35,
-    score_label: isHealthy ? "Excellent" : "Moderate",
-    analysis: [
-      { ingredient: "Refined Sugars", limit: "< 25g/day", concern: "Links to insulin resistance and metabolic dysfunction." },
-      { ingredient: "Trans Fats", limit: "Zero", concern: "Directly associated with cardiovascular inflammation." },
-      { ingredient: "Sodium Nitrate", limit: "Minimal", concern: "Potential carcinogenic effects in processed meats." },
-      { ingredient: "High Fructose Syrup", limit: "Avoid", concern: "Rapid lipid accumulation in liver tissues." }
-    ],
-    daily_limit: isHealthy 
-      ? "This product aligns well with WHO guidelines for daily intake. It is rich in complex nutrients that support sustained energy without causing spikes in insulin. For optimal health, maintain this as a staple while ensuring variety in your micronutrient sources." 
-      : "Based on the high concentration of refined additives, the WHO recommends strictly limiting this to no more than 15-20g daily. Chronic consumption above this threshold is clinically linked to increased risk of Type-2 Diabetes and hypertension due to the excessive sodium and metabolic stress from corn syrups.",
-    alternatives: [
-      "Whole-Grain Rolled Oats (Unprocessed): These provide slow-release carbohydrates and 5g of soluble fiber per serving, which actively helps lower LDL cholesterol levels compared to refined snacks.",
-      "Organic Greek Yogurt with Fresh Berries: This offers a high-protein alternative (15g per cup) with natural probiotics for gut health, avoiding the synthetic preservatives found in this item."
-    ]
-  };
-  
-  if (mockup.health_score >= 80) mockup.score_label = "Excellent";
-  else if (mockup.health_score >= 60) mockup.score_label = "Good";
-  else if (mockup.health_score >= 40) mockup.score_label = "Moderate";
-  else mockup.score_label = "Dangerous";
-
-  return mockup;
-}
-
-
-export async function POST(request: NextRequest) {
-  try {
-    const { query } = await request.json();
-    if (!query) return NextResponse.json({ error: "No query provided" }, { status: 400 });
-
-    const foodData = await fetchFoodData(query);
-    if ("error" in foodData) {
-      console.error(`[Data] Error fetching food info: ${foodData.error}`);
-      return NextResponse.json(foodData, { status: 404 });
+    
+    /* Transparent header to blend with background */
+    [data-testid="stHeader"] {
+        background-color: transparent !important;
     }
 
-    if (!foodData.ingredients_text) {
-      return NextResponse.json({
-        ...foodData,
-        error: "No ingredients data available for this product.",
-      });
+    h1, h2, h3, h4, p {
+        font-family: 'Outfit', sans-serif !important;
     }
 
-    const aiAnalysis = await analyzeWithGemini(foodData.ingredients_text);
+    .glass-card {
+        background: rgba(255, 255, 255, 0.05);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 16px;
+        padding: 24px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+    }
+    
+    .health-score {
+        font-size: 6rem;
+        font-weight: 800;
+        text-align: center;
+        background: -webkit-linear-gradient(45deg, #4ade80, #3b82f6);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin: 0;
+        line-height: 1;
+        padding-top: 10px;
+    }
+    
+    .score-label {
+        text-align: center;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        font-size: 0.9rem;
+        color: #94a3b8;
+        font-weight: 500;
+        margin-top: 12px;
+    }
+    
+    .stButton > button {
+        background: linear-gradient(to right, #3b82f6, #8b5cf6);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.5rem 2rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        width: 100%;
+    }
+    
+    .stButton > button:hover {
+        opacity: 0.9;
+        box-shadow: 0 0 15px rgba(59, 130, 246, 0.5);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    return NextResponse.json({
-      product: foodData,
-      analysis: aiAnalysis,
-    });
-  } catch (e: any) {
-    console.error(`[API] Global Error:`, e.message || e);
-    return NextResponse.json({ 
-      error: e.message || "Internal server error",
-      details: "The AI analysis reached its limit. Please try again soon."
-    }, { status: 500 });
-  }
-}
+# Hardcoded API Key (Explicitly placed per developer requirements for seamless public deployment)
+api_key = "AIzaSyCcUHBuLV0eQDsIVROH6X5_Khb8m88dWfE"
 
+if api_key:
+    genai.configure(api_key=api_key)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_food_data(query):
+    headers = {"User-Agent": "AIFoodAnalyzer/1.0"}
+    
+    # Create a robust session with exponential backoff for proxy server errors
+    session = requests.Session()
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    # Retry up to 4 times for 503 and 429 overloads with increasing delay
+    retry = Retry(total=4, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('https://', adapter)
+    
+    try:
+        # If the user typed a barcode, hit the exact product API
+        if query.isdigit() and len(query) >= 8:
+            url = f"https://world.openfoodfacts.org/api/v2/product/{query}.json"
+            response = session.get(url, headers=headers, timeout=20)
+            if response.status_code == 200:
+                data = response.json()
+                if "product" in data:
+                    return 200, {"products": [data["product"]]}
+            return response.status_code, {}
+        
+        # Otherwise, hit the text search API
+        url = f"https://world.openfoodfacts.org/cgi/search.pl?search_terms={query}&search_simple=1&action=process&json=1"
+        response = session.get(url, headers=headers, timeout=25)
+        return response.status_code, response.json() if response.status_code == 200 else {}
+    except requests.exceptions.RequestException:
+        return 503, {}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyze_ingredients_with_ai(ingredients_text, _api_key):
+    model_name = "gemini-2.5-pro"
+    try:
+        available = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        if available:
+            flash_models = [m for m in available if "pro" in m]
+            model_name = flash_models[0] if flash_models else available[0]
+            model_name = model_name.replace("models/", "")
+    except Exception:
+        pass
+        
+    model = genai.GenerativeModel(model_name)
+    prompt = f"""
+    You are an elite nutritionist AI evaluating a packaged food.
+    Ingredients: {ingredients_text}
+
+    Evaluate strictly against WHO (World Health Organization) and FSSAI (Food Safety and Standards Authority of India) guidelines.
+
+    You MUST return ONLY a raw JSON object with the following exact keys (DO NOT wrap in ```json, just the raw braces):
+    {{
+        "health_score": <int between 0 and 100 representing the overall FSSAI/WHO safety score>,
+        "analysis_table": "<markdown table with columns: Ingredient | WHO/FSSAI Limit | Concern. MAX 4 most dangerous ingredients.>",
+        "daily_limit": "<1-2 sentences: State strict daily gram limit recommendation, then briefly explain why this limit matters and what health risks may occur if exceeded.>",
+        "alternatives": "<2-3 bullet points: For each, name a specific healthier commercial brand or option, and add a short reason why it is healthier (e.g., 'lower sugar', 'no palm oil', 'higher fiber', etc.).>"
+    }}
+
+    Make the daily_limit and alternatives sections practical, clear, and user-friendly. Use simple language, but include scientific or regulatory reasoning where relevant. Avoid conversational filler, but do not be overly terse.
+    """
+    response = model.generate_content(prompt)
+    return response.text
+
+st.markdown("<h1 style='text-align: center;'>AI Food Analyzer 🍎</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #cbd5e1; margin-bottom: 2rem;'>Discover the real impact of your snacks against FSSAI & WHO standards.</p>", unsafe_allow_html=True)
+
+# Main UI layout
+col_main, col_spacer, col_sidebar = st.columns([2, 0.2, 1])
+
+with col_sidebar:
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown("### 🔍 Search")
+    food_query = st.text_input("Packaged Food Name", placeholder="e.g., Nutella, Oreo", label_visibility="collapsed")
+    analyze_btn = st.button("Analyze Food")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    if not api_key:
+        st.markdown("<p style='color: #f87171; font-size: 0.85rem;'>⚠️ System Offline: AI Engine disconnected.</p>", unsafe_allow_html=True)
+
+with col_main:
+    if analyze_btn:
+        if food_query:
+            with st.spinner(f"Analyzing {food_query}..."):
+                try:
+                    status_code, data = fetch_food_data(food_query)
+                    
+                    if status_code == 200:
+                        products = data.get("products", [])
+                        if products and len(products) > 0:
+                            # We grab the first search result, or the exact mapped barcode product
+                            top_product = products[0]
+                            # Open Food Facts uses 'product_name' and 'ingredients_text'
+                            product_name = top_product.get("product_name", "Unknown Product")
+                            ingredients = top_product.get("ingredients_text", "")
+                            
+                            st.success(f"**Found Product:** {product_name}")
+                            st.markdown(f"**Ingredients Snapshot:**  \n<span style='color: #94a3b8; font-size: 0.9em;'>{ingredients[:150]}...</span>", unsafe_allow_html=True)
+                            
+                            if ingredients and ingredients.strip() != "":
+                                clean_ingredients = ingredients.replace(", ", " • ")
+                                
+                                if not api_key:
+                                    st.warning("Critical Error: GEMINI_API_KEY is not assigned internally.")
+                                else:
+                                    try:
+                                        raw_json_output = analyze_ingredients_with_ai(clean_ingredients, api_key)
+                                        # Parse JSON safely
+                                        clean_json = raw_json_output.strip().replace("```json", "").replace("```", "")
+                                        ai_data = json.loads(clean_json)
+                                        
+                                        # Dashboard Layout
+                                        st.markdown("---")
+                                        metric_col, info_col = st.columns([1, 1.5])
+                                        
+                                        with metric_col:
+                                            st.markdown(f'<div class="glass-card"><p class="health-score">{ai_data.get("health_score", "?")}</p><p class="score-label">FSSAI / WHO Index</p></div>', unsafe_allow_html=True)
+                                            
+                                        with info_col:
+                                            st.markdown('<div class="glass-card"><h4>⚖️ Daily Limit</h4><p>' + str(ai_data.get("daily_limit", "")) + '</p><h4>🔄 Healthier Alternatives</h4>' + str(ai_data.get("alternatives", "")) + '</div>', unsafe_allow_html=True)
+                                            
+                                        st.markdown('<div class="glass-card"><h4>🔬 Flagged Ingredients Breakdown</h4>' + str(ai_data.get("analysis_table", "")) + '</div>', unsafe_allow_html=True)
+                                        
+                                    except json.JSONDecodeError:
+                                        st.error("AI returned malformed data. Try again.")
+                                        with st.expander("View Raw JSON Output"):
+                                            st.write(raw_json_output)
+                                    except Exception as e:
+                                        st.error(f"AI Error: {str(e)}")
+                            else:
+                                st.warning("No ingredients list available for this product in the Open Food Facts database.")
+                        else:
+                            st.error(f"Could not find any products matching '{food_query}'.")
+                    elif status_code == 503 or status_code == 429:
+                        st.error("🚨 Open Food Facts API is currently overloaded or rate-limiting. Try again later.")
+                    else:
+                        st.error(f"Open Food Facts API Error (Status Code: {status_code}).")
+                except Exception as e:
+                    st.error(f"Network error: {str(e)}")
+        else:
+            st.warning("Please enter a food name first.")
