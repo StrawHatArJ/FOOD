@@ -1,2 +1,20 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+# Secrets and Configuration
+.env
+.streamlit/secrets.toml
+.streamlit/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
